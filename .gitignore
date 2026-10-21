@@ -1,0 +1,6 @@
+*.exe
+build/
+__pycache__/
+profile/runs/*.log
+profile/runs/*.err
+profile/runs/coli_usage.snapshot
