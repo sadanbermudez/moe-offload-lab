@@ -75,11 +75,39 @@ If loads and compute overlapped, the drive would set the pace at roughly **1.5 t
 - **The Windows build cannot use AVX-512.** The release workflow builds the Windows DeepSeek engine without an `ARCH` (`.github/workflows/release.yml:55`), so `c/Makefile.deepseek-v4:51` applies `-march=x86-64-v3` (AVX2), and the kernel variant is chosen at compile time with no runtime dispatch. Disassembling the shipped `deepseek_v4.exe` confirms it: 0 instructions use AVX-512 (`zmm`) registers, 6,224 use AVX2 (`ymm`). The source already has an AVX-512 FP4 kernel using the same permute-as-lookup idea as `kernels/fp4_gemv.cpp` (`c/deepseek_v4.c:19780`); this build never runs it.
 - **Experts run one after another**, each a parallel-for over 16-row tiles with a fork-join per projection (`c/deepseek_v4.c:5552`, `5733`, `5792`): about 12 thread barriers per layer and 500 per token, with serial work (activation rounding, SwiGLU) between them.
 - **Loads overlap only within a layer.** Up to 9 loader threads start reading a layer's experts once its router has chosen them, and the shared expert computes meanwhile; nothing is fetched for the next layer before its router runs.
+- **On Windows, idle threads sleep at every barrier** (section 7). The shipped engine is built with MSYS2 GCC 16.1.0 (its version string is in the exe), whose OpenMP runtime, libgomp, uses `config_path="mingw32 posix"` on MinGW (`libgomp/configure.tgt`). The POSIX barrier (`libgomp/config/posix/bar.c`) waits on semaphores with no spin loop; only the Linux one (`config/linux/wait.h`) spins first. colibri's launcher sets `OMP_WAIT_POLICY=active` and `GOMP_SPINCOUNT=200000` for this engine, and on Windows neither has any effect.
+
+## 7. Experiments on the engine itself
+
+`build_engines.sh` builds colibri v2.0.0's DeepSeek engine from the release tarball twice with the same compiler (clang from llvm-mingw, with LLVM's OpenMP runtime, libomp): for `x86-64-v3` like the release (0 AVX-512 instructions) and for `znver5` (4,956). `profile_decode.ps1 -Engine` runs a build through colibri's `COLI_ENGINE` override, so the installed colibri is untouched. Each sweep interleaves its configurations and restores the same usage snapshot before every run; every run hit the cache 37% of the time, and **all 14 runs generated the same text** (same hash). Per-run numbers: `profile/runs/engine_experiments.csv`.
+
+**These runs were on battery** (the laptop was unplugged three minutes before the first; Windows' battery report shows the switch), so the shipped engine runs at about 0.21 tok/s here against 0.49 on mains power in section 3. Compare within this section, not across.
+
+**Instruction set** (`isa_sweep.ps1`):
+
+| Engine | Decode tok/s (2 runs) | CPU |
+|---|---|---|
+| shipped (GCC, libgomp, x86-64-v3) | 0.197, 0.217 | 9% |
+| clang, libomp, x86-64-v3 | 0.321, 0.324 | 46% |
+| clang, libomp, znver5 | 0.349, 0.357 | 46% |
+
+AVX-512 alone is worth about 9%. The 55% between the shipped engine and the same-ISA clang build needed another explanation.
+
+**How idle threads wait** (`wait_sweep.ps1`): change only the OpenMP wait behaviour.
+
+| Run | Decode tok/s (2 runs) | CPU |
+|---|---|---|
+| shipped, as launched | 0.227, 0.218 | 9% |
+| shipped, `GOMP_SPINCOUNT=infinite` | 0.221, 0.225 | 9% |
+| clang v3, as launched (libomp spins) | 0.326, 0.325 | 46% |
+| clang v3, `OMP_WAIT_POLICY=passive` (libomp sleeps) | 0.215, 0.212 | 10% |
+
+Told to sleep, the clang build falls to the shipped engine's speed and CPU use; told to spin, the shipped engine does not change. The whole 55% is the cost of waking sleeping threads at about 500 barriers per token, not the generated code. Spinning has a price: about 11 cores stay busy while waiting, which matters on battery.
 
 ## Next experiments
 
-1. Build the DeepSeek engine from source with `-march=znver5` and repeat the sweep: how much of the gap is the instruction set alone?
-2. Batch a layer's six experts into one parallel region (one barrier instead of twelve) and measure.
+1. Repeat section 7 on mains power for absolute numbers.
+2. Batch a layer's six experts into one parallel region (one barrier instead of twelve) and measure: with fewer barriers, the wait policy should matter less.
 3. Predict the next layer's experts from the current hidden state and prefetch them, measuring the hit rate of the guess.
 
 ## Build
@@ -88,4 +116,4 @@ If loads and compute overlapped, the drive would set the pace at roughly **1.5 t
 clang++ -std=c++20 -O2 -static iobench/iobench.cpp -o iobench.exe          # or: cmake -S iobench -B build && cmake --build build
 clang++ -std=c++20 -O3 -march=znver5 -static kernels/fp4_gemv.cpp -o fp4_gemv.exe
 ```
-Windows builds used [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) 20261006 (Clang 23); the sanitizer runs used GCC 15 in WSL Ubuntu.
+The two engine builds: `LLVM_MINGW=/c/path/to/llvm-mingw sh profile/build_engines.sh /c/path/to/build-dir` (Git Bash, needs `gh`). Windows builds used [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) 20261006 (Clang 23); the sanitizer runs used GCC 15 in WSL Ubuntu.

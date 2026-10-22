@@ -1,0 +1,15 @@
+run,experiment,engine,env,decode_tok_s,ttft_s,hit_rate_pct,mean_cpu_pct,mean_read_GBps,output_md5_8
+20261021-182603-shipped-r1,isa,shipped-gcc-v3,default,0.197,79.477,37.198,8.9,0.41,89e9e481
+20261021-182926-clang-v3-r1,isa,clang-v3,default,0.321,77.222,37.146,45.9,0.54,89e9e481
+20261021-183202-clang-znver5-r1,isa,clang-znver5,default,0.349,75.541,37.169,45.8,0.57,89e9e481
+20261021-183430-shipped-r2,isa,shipped-gcc-v3,default,0.217,81.280,37.153,9.4,0.43,89e9e481
+20261021-183744-clang-v3-r2,isa,clang-v3,default,0.324,76.629,37.102,46.0,0.55,89e9e481
+20261021-184018-clang-znver5-r2,isa,clang-znver5,default,0.357,76.134,37.102,45.9,0.57,89e9e481
+20261021-184719-shipped-default-w1,wait,shipped-gcc-v3,default,0.227,79.964,37.254,9.3,0.44,89e9e481
+20261021-185028-shipped-spin-w1,wait,shipped-gcc-v3,GOMP_SPINCOUNT=infinite,0.221,79.381,37.019,9.3,0.44,89e9e481
+20261021-185339-clang-v3-default-w1,wait,clang-v3,default,0.326,77.004,37.292,45.9,0.55,89e9e481
+20261021-185613-clang-v3-passive-w1,wait,clang-v3,OMP_WAIT_POLICY=passive,0.215,81.705,37.225,9.6,0.43,89e9e481
+20261021-185928-shipped-default-w2,wait,shipped-gcc-v3,default,0.218,79.883,37.187,9.0,0.44,89e9e481
+20261021-190241-shipped-spin-w2,wait,shipped-gcc-v3,GOMP_SPINCOUNT=infinite,0.225,79.130,37.165,9.2,0.45,89e9e481
+20261021-190550-clang-v3-default-w2,wait,clang-v3,default,0.325,77.374,37.236,45.7,0.54,89e9e481
+20261021-190826-clang-v3-passive-w2,wait,clang-v3,OMP_WAIT_POLICY=passive,0.212,81.185,37.135,9.7,0.43,89e9e481
