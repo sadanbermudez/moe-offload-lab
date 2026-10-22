@@ -2,6 +2,8 @@
 # Writes a CSV of CPU use (as a share of all logical cores), disk bytes read, and memory, plus colibri's own log.
 # Usage: .\profile_decode.ps1 -Label baseline [-Tokens 24] [-Ram 16] [-Env @{ DIRECT='0' }] [-Engine C:\path\deepseek_v4.exe]
 # -Engine runs another build of the engine through colibri's COLI_ENGINE override; empty means the shipped one.
+# Refuses to run unless the laptop is on mains power (Win32_Battery.BatteryStatus = 2).
+# -Summary <csv> appends one row per run (the columns of runs/engine_experiments.csv), using -Experiment and -EngineName.
 param(
     [string]$Label = "baseline",
     [int]$Tokens = 24,
@@ -10,8 +12,15 @@ param(
     [string]$Engine = "",
     [string]$Model = "C:\Users\sadan\models\deepseek-v4-flash",
     [string]$Colibri = "C:\Users\sadan\projects\colibri\coli.cmd",
-    [string]$Prompt = "Explain in three sentences why a mixture-of-experts model needs less compute per token than a dense model of the same size."
+    [string]$Prompt = "Explain in three sentences why a mixture-of-experts model needs less compute per token than a dense model of the same size.",
+    [string]$Summary = "",
+    [string]$Experiment = "",
+    [string]$EngineName = ""
 )
+$battery = Get-CimInstance Win32_Battery
+if ($battery -and $battery.BatteryStatus -ne 2) {
+    throw "Not on mains power (BatteryStatus=$($battery.BatteryStatus)); refusing to run $Label."
+}
 $out = Join-Path $PSScriptRoot "runs"
 New-Item -ItemType Directory -Force $out | Out-Null
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
@@ -47,3 +56,27 @@ while (-not $p.HasExited) {
     $prev = @{ id = $e.ProcessId; t = $now; cpu = $cpu; rd = $rd }
 }
 "exit $($p.ExitCode) after $([int]((Get-Date) - $t0).TotalSeconds) s -> $csv"
+
+if ($Summary) {
+    # Decode speed is colibri's own timing: tokens after the first over the time after the first.
+    # The output hash is the MD5 of the generated_text line (with its newline), first 8 hex digits.
+    $err = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes("$log.err"))
+    $inv = [cultureinfo]::InvariantCulture
+    $gen = [int]([regex]::Match($err, "v4_tokens .*?generated=(\d+)").Groups[1].Value)
+    $hit = [regex]::Match($err, "hit_rate=([\d.]+)").Groups[1].Value
+    $tm = [regex]::Match($err, "time_to_first_token=([\d.]+)s after_first=([\d.]+)s")
+    $after = [double]::Parse($tm.Groups[2].Value, $inv)
+    $line = [regex]::Match($err, "(?m)^generated_text=[^\r\n]*").Value
+    $md5 = [Security.Cryptography.MD5]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes("$line`n"))
+    $hash = (($md5 | ForEach-Object { $_.ToString("x2") }) -join "").Substring(0, 8)
+    $rows = Import-Csv $csv
+    $cpuMean = ($rows | ForEach-Object { [double]::Parse($_.cpu_pct_of_machine, $inv) } | Measure-Object -Average).Average
+    $rdMean = ($rows | ForEach-Object { [double]::Parse($_.read_GBps, $inv) } | Measure-Object -Average).Average
+    $envText = if ($Env.Count) { ($Env.Keys | Sort-Object | ForEach-Object { "$_=$($Env[$_])" }) -join ";" } else { "default" }
+    if (-not (Test-Path $Summary)) {
+        "run,experiment,engine,env,decode_tok_s,ttft_s,hit_rate_pct,mean_cpu_pct,mean_read_GBps,output_md5_8" | Set-Content $Summary
+    }
+    [string]::Format($inv, "{0},{1},{2},{3},{4:F3},{5},{6},{7:F1},{8:F2},{9}",
+        "$stamp-$Label", $Experiment, $EngineName, $envText, (($gen - 1) / $after),
+        $tm.Groups[1].Value, $hit, $cpuMean, $rdMean, $hash) | Add-Content $Summary
+}

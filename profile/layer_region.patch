@@ -1,0 +1,401 @@
+diff -ruN a/c/deepseek_v4.c b/c/deepseek_v4.c
+--- a/c/deepseek_v4.c
++++ b/c/deepseek_v4.c
+@@ -5381,6 +5381,153 @@
+ }
+ #endif
+ 
++/* ---- Layer-region experiment (moe-offload-lab, not upstream) ----
++ * The CPU loop in moe_token_pipeline runs the routed experts one after
++ * another through coli_v4_expert_forward_ref, and every matvec in it opens its
++ * own OpenMP parallel region: two per rows16-packed expert (dual gate/up, down)
++ * and three per row-major expert (gate, up, down), with the activation
++ * quantization, bf16 rounding and SwiGLU done by one thread in between.
++ * v4_layer_region computes the same experts inside ONE parallel region:
++ *   1. gate and up row tiles of every expert, one work-shared loop;
++ *   2. bf16 rounding, SwiGLU and route weight, work-shared in 128-wide blocks;
++ *   3. down row tiles of every expert, one work-shared loop;
++ *   4. the expert sum (and the shared expert), work-shared over the hidden size.
++ * Each thread quantizes the activations into its own thread-local scratch
++ * (the same coli_fp8_activation_qdq_ref call the kernels make), so only the
++ * three barriers the data needs remain. Every row is computed by the same tile
++ * code as the reference kernels and the experts are summed in the same order,
++ * so the output is bit-identical. Returns 0 when it produced `output`; nonzero
++ * means the caller must zero `output` and run the reference loop (a layout this
++ * path does not take, or a failed scratch allocation). V4_LAYER_REGION=0 turns
++ * it off. */
++#if defined(_OPENMP) && defined(__AVX2__)
++#include "native_quant_fp4_rows16.h"
++#endif
++#if defined(_OPENMP) && defined(__AVX2__) && defined(COLI_FP4_ROWS16_KERNEL)
++#define V4_LAYER_REGION 1
++static int v4_lr_rowmajor_ok(const ColiTensorView *w) {
++    if (!w || w->gpu || w->format != COLI_TENSOR_FP4_NATIVE_BLOCK ||
++        w->scale_format != COLI_SCALE_UE8M0 || !w->data || !w->scales ||
++        w->rows < 1 || w->rows % 16 || w->columns < 1 || w->columns % 128 ||
++        w->block_rows != 1 || w->block_columns != 32) return 0;
++    size_t rows = (size_t)w->rows, columns = (size_t)w->columns;
++    return w->data_bytes == rows * (columns / 2) &&
++           w->scale_bytes == rows * (columns / 32);
++}
++
++static int v4_lr_packed_ok(const ColiTensorView *w) {
++    return w && !w->gpu && coli_fp4_rows16_v10_packed_ok(w);
++}
++
++static int v4_layer_region(float *output, const ColiExpertView *views,
++                           const float *route_weights, int count,
++                           const float *input, const float *shared,
++                           int d, float limit, int add_shared) {
++    static int enabled = -1;
++    if (enabled < 0) {
++        const char *value = getenv("V4_LAYER_REGION");
++        enabled = !(value && value[0] == '0');
++    }
++    enum { MAX_EXPERTS = 64 };
++    if (!enabled || !output || !views || !route_weights || !input ||
++        (add_shared && !shared) || count < 1 || count > MAX_EXPERTS ||
++        d < 1 || d % 128 || limit < 0.0f) return 1;
++    int packed[MAX_EXPERTS];
++    int64_t inter = views[0].gate.rows;
++    for (int k = 0; k < count; k++) {
++        const ColiExpertView *e = &views[k];
++        if (e->gate.rows != inter || e->up.rows != inter ||
++            e->gate.columns != d || e->up.columns != d ||
++            e->down.rows != d || e->down.columns != inter) return 1;
++        if (e->gate.block_rows == 16 && e->up.block_rows == 16 &&
++            e->down.block_rows == 16) {
++            if (!v4_lr_packed_ok(&e->gate) || !v4_lr_packed_ok(&e->up) ||
++                !v4_lr_packed_ok(&e->down)) return 1;
++            packed[k] = 1;
++        } else {
++            if (!v4_lr_rowmajor_ok(&e->gate) || !v4_lr_rowmajor_ok(&e->up) ||
++                !v4_lr_rowmajor_ok(&e->down)) return 1;
++            packed[k] = 0;
++        }
++    }
++    size_t n = (size_t)count, I = (size_t)inter, D = (size_t)d;
++    if (I % 128) return 1;
++    float *gate = malloc(n * I * sizeof(*gate));
++    float *up = malloc(n * I * sizeof(*up));
++    float *act = malloc(n * I * sizeof(*act));
++    float *down = malloc(n * D * sizeof(*down));
++    if (!gate || !up || !act || !down) {
++        free(down); free(act); free(up); free(gate); return 1;
++    }
++    const int64_t in_tiles = (int64_t)(I / 16), out_tiles = (int64_t)(D / 16);
++    const int64_t blocks = (int64_t)(I / 128);
++    const size_t scratch = D > n * I ? D : n * I;
++    int failed = 0;
++    #pragma omp parallel
++    {
++        float *x = NULL; uint8_t *x_scales = NULL;
++        int bad = coli_v4_qdq_scratch(scratch, scratch / 128, &x, &x_scales) ||
++                  coli_fp8_activation_qdq_ref(x, x_scales, input, D, 128);
++        /* 1. gate and up: (expert, matrix, row tile) jobs */
++        #pragma omp for schedule(static)
++        for (int64_t job = 0; job < (int64_t)n * 2 * in_tiles; job++) {
++            if (bad) continue;
++            int64_t k = job / (2 * in_tiles), r = job % (2 * in_tiles);
++            int is_up = r >= in_tiles;
++            int64_t tile = is_up ? r - in_tiles : r;
++            const ColiTensorView *w = is_up ? &views[k].up : &views[k].gate;
++            float *y = (is_up ? up : gate) + (size_t)k * I;
++            if (packed[k]) coli_fp4_rows16_v10_tile(y, w, x, tile);
++            else coli_fp4_rows16_order_tile(y, w->data, w->scales, x,
++                                            (int)D, tile);
++        }
++        /* 2. the elementwise step of coli_v4_expert_forward_ref, per block */
++        #pragma omp for schedule(static)
++        for (int64_t c = 0; c < (int64_t)n * blocks; c++) {
++            int64_t k = c / blocks;
++            size_t offset = (size_t)k * I + (size_t)(c % blocks) * 128;
++            coli_bf16_round_array(gate + offset, 128);
++            coli_bf16_round_array(up + offset, 128);
++            coli_v4_swiglu(act + offset, gate + offset, up + offset, 128, limit);
++            for (size_t i = 0; i < 128; i++)
++                act[offset + i] = coli_bf16_round(act[offset + i] *
++                                                  route_weights[k]);
++        }
++        /* 3. down: each thread quantizes every expert's activation, then
++         * takes its share of the (expert, row tile) jobs */
++        for (size_t k = 0; !bad && k < n; k++)
++            bad = coli_fp8_activation_qdq_ref(x + k * I, x_scales + k * (I / 128),
++                                              act + k * I, I, 128) != 0;
++        #pragma omp for schedule(static)
++        for (int64_t job = 0; job < (int64_t)n * out_tiles; job++) {
++            if (bad) continue;
++            int64_t k = job / out_tiles, tile = job % out_tiles;
++            const ColiTensorView *w = &views[k].down;
++            float *y = down + (size_t)k * D;
++            const float *xa = x + (size_t)k * I;
++            if (packed[k]) coli_fp4_rows16_v10_tile(y, w, xa, tile);
++            else coli_fp4_rows16_order_tile(y, w->data, w->scales, xa,
++                                            (int)I, tile);
++        }
++        /* 4. sum in expert order: output starts at zero, each expert's output
++         * is bf16-rounded and added, then the shared expert, as the loop does */
++        #pragma omp for schedule(static) nowait
++        for (int64_t i = 0; i < (int64_t)D; i++) {
++            float sum = output[i];
++            for (size_t k = 0; k < n; k++)
++                sum += coli_bf16_round(down[k * D + (size_t)i]);
++            output[i] = add_shared ? coli_bf16_round(sum + shared[i]) : sum;
++        }
++        if (bad) {
++            #pragma omp atomic write
++            failed = 1;
++        }
++    }
++    free(down); free(act); free(up); free(gate);
++    return failed;
++}
++#endif
++
+ static int moe_token_pipeline(float *output,
+                               const ColiDeepSeekV4LayerWeights *weights,
+                               const ColiDeepSeekV4Config *config,
+@@ -5825,6 +5972,14 @@
+                                             shared_output, d, config->swiglu_limit);
+         } else {
+ #endif
++#ifdef V4_LAYER_REGION
++        int layer_region_done = !result && v4_layer_region(
++            output, views, expert_weights, selected, input, shared_output, d,
++            config->swiglu_limit, V4_SHARED_HERE) == 0;
++        if (!layer_region_done && !result)
++            memset(output, 0, (size_t)d * sizeof(*output));
++        if (!layer_region_done) {
++#endif
+         for (int current = 0; !result && current < selected; current++) {
+             if (!result) result = coli_v4_expert_forward_ref(
+                 expert_output, &views[current], input,
+@@ -5835,6 +5990,9 @@
+         if (!result && V4_SHARED_HERE)
+             for (int i = 0; i < d; i++)
+                 output[i] = coli_bf16_round(output[i] + shared_output[i]);
++#ifdef V4_LAYER_REGION
++        }
++#endif
+ #if defined(COLI_VULKAN) && defined(COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER)
+         }
+ #endif
+@@ -19152,6 +19310,109 @@
+ #endif
+ }
+ 
++#ifdef __AVX2__
++/* Layer-region experiment (moe-offload-lab, not upstream): the AVX2 batch-one
++ * loop body of coli_fp4_matvec_rows16_order above, copied verbatim, for one
++ * 16-row tile. A caller that is already inside an OpenMP team work-shares the
++ * tiles itself instead of opening a parallel region per matrix. Same code,
++ * same per-row operation order, so the same bits. */
++void coli_fp4_rows16_order_tile(float *y, const uint8_t *q4,
++                                const uint8_t *e8s, const float *x,
++                                int I, int64_t tile) {
++    int rb = I / 2, ng = I / 32;
++    float e8lut[256];
++    memcpy(e8lut, coli_e8m0_table(), sizeof(e8lut));
++    {
++        const __m128i lut2 = _mm_setr_epi8(
++            0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12);
++        const __m128i m4 = _mm_set1_epi8(0x0F);
++        const __m256 half = _mm256_set1_ps(0.5f);
++        __m256 sum0 = _mm256_setzero_ps(), sum1 = _mm256_setzero_ps();
++        for (int base = 0; base < I; base += 32) {
++            /* Consume each transposed 8-row half immediately.  The old
++             * scalar kernel wrote 2 KiB of column vectors to tmp and loaded
++             * them back solely to feed this one activation; keeping the
++             * columns live removes that round trip while preserving each
++             * row's column-by-column accumulation order. */
++            for (int half_rows = 0; half_rows < 2; half_rows++) {
++                float sc[8];
++                __m256 rowv[8][4];
++                for (int r8 = 0; r8 < 8; r8++) {
++                    int64_t row = tile * 16 + half_rows * 8 + r8;
++                    sc[r8] = e8lut[e8s[row * ng + base / 32]];
++                    __m128i by = _mm_loadu_si128(
++                        (const __m128i *)(q4 + row * rb + base / 2));
++                    __m128i lo = _mm_and_si128(by, m4);
++                    __m128i hi = _mm_and_si128(_mm_srli_epi16(by, 4), m4);
++                    __m128i n0 = _mm_shuffle_epi8(
++                        lut2, _mm_unpacklo_epi8(lo, hi));
++                    __m128i n1 = _mm_shuffle_epi8(
++                        lut2, _mm_unpackhi_epi8(lo, hi));
++                    rowv[r8][0] = _mm256_mul_ps(_mm256_cvtepi32_ps(
++                        _mm256_cvtepi8_epi32(n0)), half);
++                    rowv[r8][1] = _mm256_mul_ps(_mm256_cvtepi32_ps(
++                        _mm256_cvtepi8_epi32(_mm_srli_si128(n0, 8))), half);
++                    rowv[r8][2] = _mm256_mul_ps(_mm256_cvtepi32_ps(
++                        _mm256_cvtepi8_epi32(n1)), half);
++                    rowv[r8][3] = _mm256_mul_ps(_mm256_cvtepi32_ps(
++                        _mm256_cvtepi8_epi32(_mm_srli_si128(n1, 8))), half);
++                }
++                __m256 scale = _mm256_loadu_ps(sc);
++                __m256 partial = half_rows ? sum1 : sum0;
++                for (int cb = 0; cb < 4; cb++) {
++                    __m256 blk[8];
++                    for (int r8 = 0; r8 < 8; r8++)
++                        blk[r8] = rowv[r8][cb];
++                    __m256 t0 = _mm256_unpacklo_ps(blk[0], blk[1]);
++                    __m256 t1 = _mm256_unpackhi_ps(blk[0], blk[1]);
++                    __m256 t2 = _mm256_unpacklo_ps(blk[2], blk[3]);
++                    __m256 t3 = _mm256_unpackhi_ps(blk[2], blk[3]);
++                    __m256 t4 = _mm256_unpacklo_ps(blk[4], blk[5]);
++                    __m256 t5 = _mm256_unpackhi_ps(blk[4], blk[5]);
++                    __m256 t6 = _mm256_unpacklo_ps(blk[6], blk[7]);
++                    __m256 t7 = _mm256_unpackhi_ps(blk[6], blk[7]);
++                    __m256 s0 = _mm256_shuffle_ps(
++                        t0, t2, _MM_SHUFFLE(1,0,1,0));
++                    __m256 s1 = _mm256_shuffle_ps(
++                        t0, t2, _MM_SHUFFLE(3,2,3,2));
++                    __m256 s2 = _mm256_shuffle_ps(
++                        t1, t3, _MM_SHUFFLE(1,0,1,0));
++                    __m256 s3 = _mm256_shuffle_ps(
++                        t1, t3, _MM_SHUFFLE(3,2,3,2));
++                    __m256 s4 = _mm256_shuffle_ps(
++                        t4, t6, _MM_SHUFFLE(1,0,1,0));
++                    __m256 s5 = _mm256_shuffle_ps(
++                        t4, t6, _MM_SHUFFLE(3,2,3,2));
++                    __m256 s6 = _mm256_shuffle_ps(
++                        t5, t7, _MM_SHUFFLE(1,0,1,0));
++                    __m256 s7 = _mm256_shuffle_ps(
++                        t5, t7, _MM_SHUFFLE(3,2,3,2));
++                    __m256 weights[8] = {
++                        _mm256_permute2f128_ps(s0, s4, 0x20),
++                        _mm256_permute2f128_ps(s1, s5, 0x20),
++                        _mm256_permute2f128_ps(s2, s6, 0x20),
++                        _mm256_permute2f128_ps(s3, s7, 0x20),
++                        _mm256_permute2f128_ps(s0, s4, 0x31),
++                        _mm256_permute2f128_ps(s1, s5, 0x31),
++                        _mm256_permute2f128_ps(s2, s6, 0x31),
++                        _mm256_permute2f128_ps(s3, s7, 0x31),
++                    };
++                    for (int column = 0; column < 8; column++) {
++                        __m256 xv = _mm256_set1_ps(
++                            x[base + cb * 8 + column]);
++                        partial = _mm256_add_ps(partial, _mm256_mul_ps(
++                            _mm256_mul_ps(xv, weights[column]), scale));
++                    }
++                }
++                if (half_rows) sum1 = partial; else sum0 = partial;
++            }
++        }
++        _mm256_storeu_ps(y + tile * 16, sum0);
++        _mm256_storeu_ps(y + tile * 16 + 8, sum1);
++    }
++}
++#endif
++
+ int coli_fp4_matvec_ref(float *output, const ColiTensorView *weight,
+                         const float *input) {
+     if (!output || !weight || !input ||
+@@ -20167,6 +20428,72 @@
+     return 0;
+ #endif
+ }
++
++/* Layer-region experiment (moe-offload-lab, not upstream): the loop body of
++ * coli_fp4_matvec_rows16_v10 above, copied verbatim, for one 16-row tile of an
++ * activation the caller has already quantized (coli_fp8_activation_qdq_ref),
++ * so a caller inside an OpenMP team can work-share the tiles itself. */
++int coli_fp4_rows16_v10_packed_ok(const ColiTensorView *weight) {
++    return packed_valid(weight);
++}
++#if defined(COLI_FP4_ROWS16_KERNEL) && defined(__AVX512F__)
++void coli_fp4_rows16_v10_tile(float *output, const ColiTensorView *weight,
++                              const float *activation, int64_t tile) {
++    size_t columns = (size_t)weight->columns;
++    size_t data_stride = columns / 2, scale_stride = columns / 32;
++    __m512 fp4_table; float e8[256]; decode_tables(&fp4_table, e8);
++    const unsigned char *data = weight->data, *scales = weight->scales;
++    {
++        __m512 sum = _mm512_setzero_ps();
++        for (size_t base = 0; base < columns; base += 32) {
++            __m512 scale = decode_scales_rows16(
++                scales + ((size_t)tile * scale_stride + base / 32) * 16, e8);
++            for (size_t offset = 0; offset < 32; offset++) {
++                size_t column = base + offset;
++                const unsigned char *codes = data +
++                    ((size_t)tile * data_stride + column / 2) * 16;
++                __m512 values = decode_fp4_rows16(codes, column & 1, fp4_table);
++                __m512 product = _mm512_mul_ps(
++                    _mm512_mul_ps(_mm512_set1_ps(activation[column]), values),
++                    scale);
++                sum = _mm512_add_ps(sum, product);
++            }
++        }
++        _mm512_storeu_ps(output + (size_t)tile * 16, sum);
++    }
++}
++#elif defined(COLI_FP4_ROWS16_KERNEL) && defined(__AVX2__)
++void coli_fp4_rows16_v10_tile(float *output, const ColiTensorView *weight,
++                              const float *activation, int64_t tile) {
++    size_t columns = (size_t)weight->columns;
++    size_t data_stride = columns / 2, scale_stride = columns / 32;
++    Avx2Rows16Tables tables; avx2_rows16_tables(&tables);
++    const unsigned char *data = weight->data, *scales = weight->scales;
++    {
++        __m256 sum[2] = {_mm256_setzero_ps(), _mm256_setzero_ps()};
++        for (size_t base = 0; base < columns; base += 32) {
++            __m256 scale[2];
++            avx2_decode_scales(
++                scale,
++                scales + ((size_t)tile * scale_stride + base / 32) * 16,
++                &tables);
++            for (size_t offset = 0; offset < 32; offset++) {
++                size_t column = base + offset;
++                const unsigned char *codes = data +
++                    ((size_t)tile * data_stride + column / 2) * 16;
++                __m256 values[2];
++                avx2_decode_rows16(values, codes, column & 1, &tables);
++                __m256 x = _mm256_set1_ps(activation[column]);
++                for (int half = 0; half < 2; half++)
++                    sum[half] = _mm256_add_ps(sum[half], _mm256_mul_ps(
++                        _mm256_mul_ps(x, values[half]), scale[half]));
++            }
++        }
++        _mm256_storeu_ps(output + (size_t)tile * 16, sum[0]);
++        _mm256_storeu_ps(output + (size_t)tile * 16 + 8, sum[1]);
++    }
++}
++#endif
+ #endif /* COLI_V4_UNIT_NATIVE_QUANT_ROWS16 */
+ 
+ #if defined(COLI_V4_UNIT_SEGMENT_ADAPTER) && defined(COLI_SEGMENT_ADAPTER)
+diff -ruN a/c/native_quant.h b/c/native_quant.h
+--- a/c/native_quant.h
++++ b/c/native_quant.h
+@@ -45,6 +45,14 @@
+ void coli_fp4_matvec_rows16_order(float *y, const uint8_t *q4,
+                                   const uint8_t *e8s, const float *x,
+                                   int I, int O);
++#ifdef __AVX2__
++/* Layer-region experiment (moe-offload-lab): one 16-row tile of the AVX2
++ * coli_fp4_matvec_rows16_order loop, for callers already inside an OpenMP
++ * team. `x` is the already-qdq'd activation, as above. */
++void coli_fp4_rows16_order_tile(float *y, const uint8_t *q4,
++                                const uint8_t *e8s, const float *x,
++                                int I, int64_t tile);
++#endif
+ /* Batch-major companion: independent scalar-order accumulators share each
+  * decoded weight tile, so the matrix is streamed once for the whole batch. */
+ void coli_fp4_matmul_batch_rows16_order(float *y, const uint8_t *q4,
+diff -ruN a/c/native_quant_fp4_rows16.h b/c/native_quant_fp4_rows16.h
+--- a/c/native_quant_fp4_rows16.h
++++ b/c/native_quant_fp4_rows16.h
+@@ -23,4 +23,14 @@
+                                     const ColiTensorView *b,
+                                     const float *input);
+ 
++/* Layer-region experiment (moe-offload-lab): the layout check of the kernels
++ * above, and one 16-row tile of coli_fp4_matvec_rows16_v10 on an activation
++ * the caller has already quantized, for callers already inside an OpenMP
++ * team (x86 only). */
++int coli_fp4_rows16_v10_packed_ok(const ColiTensorView *weight);
++#if defined(COLI_FP4_ROWS16_KERNEL) && (defined(__AVX512F__) || defined(__AVX2__))
++void coli_fp4_rows16_v10_tile(float *output, const ColiTensorView *weight,
++                              const float *activation, int64_t tile);
++#endif
++
+ #endif
