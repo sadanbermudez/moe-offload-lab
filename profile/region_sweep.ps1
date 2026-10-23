@@ -2,7 +2,8 @@
 # against the unmodified clang builds, for both instruction sets and both OpenMP wait policies.
 # All eight conditions interleaved per repeat; same usage snapshot before every run.
 param([int]$Tokens = 24, [int]$Repeats = 2, [string]$Builds = "C:\Users\sadan\projects\colibri-znver5-build",
-      [string]$Experiment = "region", [string]$Summary = (Join-Path $PSScriptRoot "runs\engine_experiments.csv"))
+      [string]$Experiment = "region", [string]$Summary = (Join-Path $PSScriptRoot "runs\engine_experiments.csv"),
+      [switch]$AllowBattery)
 $model = "C:\Users\sadan\models\deepseek-v4-flash"
 $usage = Join-Path $model ".coli_usage"
 $snap = Join-Path $PSScriptRoot "runs\coli_usage.snapshot"
@@ -21,7 +22,7 @@ for ($r = 1; $r -le $Repeats; $r++) {
             Copy-Item $snap $usage -Force
             & (Join-Path $PSScriptRoot "profile_decode.ps1") -Label "$name-$policy-g$r" -Tokens $Tokens `
                 -Engine $engines[$name] -Env $policies[$policy] `
-                -Summary $Summary -Experiment $Experiment -EngineName $name
+                -Summary $Summary -Experiment $Experiment -EngineName $name -AllowBattery:$AllowBattery
         }
     }
 }

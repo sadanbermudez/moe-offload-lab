@@ -2,7 +2,8 @@
 # Writes a CSV of CPU use (as a share of all logical cores), disk bytes read, and memory, plus colibri's own log.
 # Usage: .\profile_decode.ps1 -Label baseline [-Tokens 24] [-Ram 16] [-Env @{ DIRECT='0' }] [-Engine C:\path\deepseek_v4.exe]
 # -Engine runs another build of the engine through colibri's COLI_ENGINE override; empty means the shipped one.
-# Refuses to run unless the laptop is on mains power (Win32_Battery.BatteryStatus = 2).
+# Refuses to run unless the laptop is on mains power (Win32_Battery.BatteryStatus = 2); -AllowBattery runs anyway
+# (tag such runs as battery runs: absolute speed on battery is about half) but still stops below 30% charge.
 # -Summary <csv> appends one row per run (the columns of runs/engine_experiments.csv), using -Experiment and -EngineName.
 param(
     [string]$Label = "baseline",
@@ -15,10 +16,14 @@ param(
     [string]$Prompt = "Explain in three sentences why a mixture-of-experts model needs less compute per token than a dense model of the same size.",
     [string]$Summary = "",
     [string]$Experiment = "",
-    [string]$EngineName = ""
+    [string]$EngineName = "",
+    [switch]$AllowBattery
 )
 $battery = Get-CimInstance Win32_Battery
-if ($battery -and $battery.BatteryStatus -ne 2) {
+if ($battery -and $AllowBattery -and $battery.EstimatedChargeRemaining -lt 30) {
+    throw "Battery at $($battery.EstimatedChargeRemaining)%; refusing to run $Label."
+}
+if ($battery -and $battery.BatteryStatus -ne 2 -and -not $AllowBattery) {
     throw "Not on mains power (BatteryStatus=$($battery.BatteryStatus)); refusing to run $Label."
 }
 $out = Join-Path $PSScriptRoot "runs"
